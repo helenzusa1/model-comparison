@@ -1,7 +1,8 @@
 import os
 import time
+import httpx
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
-from openai import OpenAI, NotFoundError
+from openai import OpenAI, NotFoundError, APITimeoutError, APIConnectionError
 import tiktoken
 
 
@@ -15,9 +16,17 @@ token_provider = get_bearer_token_provider(
     "https://cognitiveservices.azure.com/.default"
 )
 
+# Explicit timeouts: fail fast on connect, allow long streamed generations.
+# Override via env vars if needed.
+CONNECT_TIMEOUT_S = float(os.getenv("AOAI_CONNECT_TIMEOUT_S", "10"))
+REQUEST_TIMEOUT_S = float(os.getenv("AOAI_REQUEST_TIMEOUT_S", "300"))
+MAX_RETRIES = int(os.getenv("AOAI_MAX_RETRIES", "3"))
+
 client = OpenAI(
     base_url=base_url,
-    api_key=token_provider
+    api_key=token_provider,
+    timeout=httpx.Timeout(REQUEST_TIMEOUT_S, connect=CONNECT_TIMEOUT_S),
+    max_retries=MAX_RETRIES,
 )
 
 # ---- 3) Preflight ----
@@ -25,6 +34,11 @@ try:
     _ = client.models.list()
 except NotFoundError:
     raise RuntimeError("Invalid Azure OpenAI endpoint")
+except (APITimeoutError, APIConnectionError) as e:
+    raise RuntimeError(
+        f"Could not connect to {endpoint} within {CONNECT_TIMEOUT_S}s "
+        f"after {MAX_RETRIES} retries: {e}"
+    ) from e
 
 PROMPT = """Explain GraphRAG in detail.
 Cover:
@@ -115,7 +129,12 @@ tests = [
 
 print("\nModel metrics:")
 for model, reasoning in tests:
-    m = measure_metrics(model, reasoning)
+    try:
+        m = measure_metrics(model, reasoning)
+    except (APITimeoutError, APIConnectionError) as e:
+        # Don't abort the whole comparison if one deployment times out.
+        print(f"{label_for(model, reasoning):30} FAILED: {type(e).__name__}: {e}")
+        continue
     print(
         f"{label_for(model, reasoning):30} "
         f"TTFT={fmt(m['ttft_s'], '.3f')}s "
